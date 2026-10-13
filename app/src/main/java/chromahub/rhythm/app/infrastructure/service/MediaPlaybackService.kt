@@ -3013,6 +3013,12 @@ notificationManager.createNotificationChannel(sleepTimerChannel)
                 decoderName.isNotBlank() && !isHardwareDecoder && sourceCodec in listOf("FLAC", "AAC", "MP3") -> {
                     "Software decoder fallback • ${decoderName.substringAfterLast('.')}"
                 }
+                detectedQuality.qualityType == AudioQualityDetector.QualityType.DOLBY_ATMOS -> {
+                    "Spatial Audio • Full object rendering reproduced"
+                }
+                detectedQuality.isDolby || detectedQuality.isDTS || detectedQuality.qualityType == AudioQualityDetector.QualityType.MPEG_H_3D -> {
+                    "Multichannel surround sound • Full quality reproduced"
+                }
                 detectedQuality.isLossless -> {
                     "Full quality output • Matched device capability"
                 }
@@ -3043,6 +3049,11 @@ notificationManager.createNotificationChannel(sleepTimerChannel)
                 isResampled = isResampled,
                 resamplingDescription = resamplingDesc,
                 isBitPerfect = isBitPerfect,
+                isLossless = detectedQuality.isLossless,
+                isHiRes = detectedQuality.isHiRes,
+                isDolby = detectedQuality.isDolby,
+                isDTS = detectedQuality.isDTS,
+                qualityCategory = detectedQuality.category,
                 qualityType = detectedQuality.qualityType,
                 qualityLabel = detectedQuality.qualityLabel,
                 qualityDescription = detectedQuality.qualityDescription,
