@@ -2819,6 +2819,17 @@ notificationManager.createNotificationChannel(sleepTimerChannel)
         // Update widget when play/pause state changes
         updateWidgetFromMediaItem(player.currentMediaItem)
     }
+
+    override fun onPlaybackParametersChanged(playbackParameters: androidx.media3.common.PlaybackParameters) {
+        super.onPlaybackParametersChanged(playbackParameters)
+        Log.d(TAG, "onPlaybackParametersChanged: speed=${playbackParameters.speed}, pitch=${playbackParameters.pitch}")
+        if (appSettings.playbackSpeed.value != playbackParameters.speed) {
+            appSettings.setPlaybackSpeed(playbackParameters.speed)
+        }
+        if (appSettings.playbackPitch.value != playbackParameters.pitch) {
+            appSettings.setPlaybackPitch(playbackParameters.pitch)
+        }
+    }
     
     /**
      * Helper function to convert MediaItem to Song for scrobbling and widgets
