@@ -58,6 +58,7 @@ import chromahub.rhythm.app.shared.data.model.FolderNode
 import chromahub.rhythm.app.shared.data.model.PlaybackQualityInfo
 import chromahub.rhythm.app.infrastructure.service.MediaPlaybackService
 import chromahub.rhythm.app.infrastructure.widget.WidgetUpdater
+import chromahub.rhythm.app.util.StoragePathUtils
 import chromahub.rhythm.app.util.AudioDeviceManager
 import chromahub.rhythm.app.util.EqualizerUtils
 import chromahub.rhythm.app.util.GsonUtils
@@ -752,38 +753,15 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     }
     
     private fun normalizeStoragePath(path: String): String {
-        var normalized = path.trim().replace('\\', '/')
-        while (normalized.contains("//")) {
-            normalized = normalized.replace("//", "/")
-        }
-        if (normalized.length > 1 && normalized.endsWith('/')) {
-            normalized = normalized.substring(0, normalized.length - 1)
-        }
-        // Resolve legacy symlink aliases (e.g. /sdcard, /storage/self/primary) to the
-        // canonical external storage path using OS-level symlink resolution
-        val externalStorage = android.os.Environment.getExternalStorageDirectory().absolutePath
-        if (normalized.startsWith("/") && !normalized.startsWith(externalStorage)) {
-            normalized = try {
-                val candidate = File(normalized).canonicalPath
-                if (candidate.startsWith(externalStorage)) candidate else normalized
-            } catch (_: java.io.IOException) {
-                normalized
-            }
-        }
-        return normalized
+        return StoragePathUtils.sanitizeAndNormalizePath(path)
     }
 
     private fun isNormalizedPathInFolders(normChild: String, normFolders: List<String>): Boolean {
-        return normFolders.any { normParent ->
-            normParent.equals(normChild, ignoreCase = true) ||
-                normChild.startsWith(if (normParent.endsWith('/')) normParent else "$normParent/", ignoreCase = true)
-        }
+        return StoragePathUtils.isPathInFolders(normChild, normFolders)
     }
 
     private fun isFolderSubdirectoryOrEqual(parent: String, child: String): Boolean {
-        val normParent = normalizeStoragePath(parent)
-        val normChild = normalizeStoragePath(child)
-        return isNormalizedPathInFolders(normChild, listOf(normParent))
+        return StoragePathUtils.isFolderSubdirectoryOrEqual(parent, child)
     }
 
     private fun isPathBlacklisted(songPath: String, blacklistedFolders: List<String>): Boolean {
@@ -1361,13 +1339,18 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         // This runs independently but only acts after initialization completes
         viewModelScope.launch {
             combine(
-                appSettings.blacklistedSongs,
-                appSettings.blacklistedFolders,
-                appSettings.whitelistedSongs,
-                appSettings.whitelistedFolders,
-                appSettings.mediaScanMode
-            ) { blacklistedSongs, blacklistedFolders, whitelistedSongs, whitelistedFolders, mediaScanMode ->
-                // Trigger when any filter changes
+                combine(
+                    appSettings.blacklistedSongs,
+                    appSettings.blacklistedFolders,
+                    appSettings.whitelistedSongs,
+                    appSettings.whitelistedFolders
+                ) { _, _, _, _ -> Unit },
+                combine(
+                    appSettings.mediaScanMode,
+                    appSettings.includeHiddenWhitelistedMedia
+                ) { _, _ -> Unit }
+            ) { _, _ ->
+                // Trigger when any filter or scan mode changes
                 Unit
             }.collect {
                 // Wait for initialization to complete before refreshing
