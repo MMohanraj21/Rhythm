@@ -49,6 +49,7 @@ import chromahub.rhythm.app.shared.data.model.MediaScanMode
 import chromahub.rhythm.app.shared.data.model.ScanPhase
 import chromahub.rhythm.app.features.local.data.repository.MusicRepository
 import chromahub.rhythm.app.features.local.data.database.entity.toSong
+import chromahub.rhythm.app.features.local.data.database.entity.toEntity
 import chromahub.rhythm.app.shared.data.model.PlaybackLocation
 import chromahub.rhythm.app.shared.data.model.Playlist
 import chromahub.rhythm.app.shared.data.model.Queue
@@ -72,9 +73,11 @@ import com.google.common.util.concurrent.MoreExecutors
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.combine
@@ -3441,7 +3444,6 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 Log.w(TAG, "ensurePlaylistsSaved skipped because playlists are not loaded")
                 return
             }
-            savePlaylistsJob?.cancel()
             runBlocking(Dispatchers.IO) {
                 savePlaylistsToRoom(_playlists.value)
             }
@@ -3632,15 +3634,27 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 
                 var hasUnpersistedInMemoryPlaylists = false
                 withContext(Dispatchers.Main) {
-                    val inMemoryUserPlaylists = _playlists.value.filter { p ->
+                    val currentInMemory = _playlists.value
+                    val finalPlaylists = playlists.map { dbPlaylist ->
+                        if (dbPlaylist.id in Playlist.DEFAULT_PLAYLIST_IDS) {
+                            dbPlaylist
+                        } else {
+                            val inMemoryMatch = currentInMemory.find { it.id == dbPlaylist.id }
+                            if (inMemoryMatch != null && (inMemoryMatch.dateModified > dbPlaylist.dateModified || inMemoryMatch.songs.size > dbPlaylist.songs.size)) {
+                                Log.i(TAG, "Preserving in-memory user playlist ${inMemoryMatch.name} (has ${inMemoryMatch.songs.size} songs vs DB ${dbPlaylist.songs.size})")
+                                hasUnpersistedInMemoryPlaylists = true
+                                inMemoryMatch
+                            } else {
+                                dbPlaylist
+                            }
+                        }
+                    } + currentInMemory.filter { p ->
                         p.id !in Playlist.DEFAULT_PLAYLIST_IDS && playlists.none { it.id == p.id }
-                    }
-                    val finalPlaylists = if (inMemoryUserPlaylists.isNotEmpty()) {
-                        Log.i(TAG, "Preserving ${inMemoryUserPlaylists.size} in-memory playlists not yet in Room")
-                        hasUnpersistedInMemoryPlaylists = true
-                        playlists + inMemoryUserPlaylists
-                    } else {
-                        playlists
+                    }.also { unpersisted ->
+                        if (unpersisted.isNotEmpty()) {
+                            hasUnpersistedInMemoryPlaylists = true
+                            Log.i(TAG, "Preserving ${unpersisted.size} in-memory playlists not yet in Room")
+                        }
                     }
                     _playlists.value = finalPlaylists
                     isPlaylistsLoaded = true
@@ -3733,18 +3747,26 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private var savePlaylistsJob: Job? = null
+    private val playlistSaveChannel = Channel<Unit>(Channel.CONFLATED)
+    private var playlistSaveWorkerJob: Job? = null
 
-    private fun savePlaylists(immediate: Boolean = false) {
-        savePlaylistsJob?.cancel()
-        if (immediate) {
-            savePlaylistsJob = viewModelScope.launch(Dispatchers.IO) {
+    private fun ensurePlaylistSaveWorker() {
+        if (playlistSaveWorkerJob?.isActive == true) return
+        playlistSaveWorkerJob = viewModelScope.launch(Dispatchers.IO) {
+            for (signal in playlistSaveChannel) {
                 savePlaylistsToRoom(_playlists.value)
             }
+        }
+    }
+
+    private fun savePlaylists(immediate: Boolean = false) {
+        ensurePlaylistSaveWorker()
+        if (immediate) {
+            playlistSaveChannel.trySend(Unit)
         } else {
-            savePlaylistsJob = viewModelScope.launch(Dispatchers.IO) {
+            viewModelScope.launch(Dispatchers.IO) {
                 delay(200) // Debounce rapid consecutive mutations
-                savePlaylistsToRoom(_playlists.value)
+                playlistSaveChannel.trySend(Unit)
             }
         }
     }
@@ -3815,30 +3837,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     val distinctDbSongEntities = currentPlaylists.asSequence()
                         .flatMap { it.songs.asSequence() }
                         .distinctBy { it.id }
-                        .map { song ->
-                            chromahub.rhythm.app.features.local.data.database.entity.SongEntity(
-                                id = song.id,
-                                title = song.title,
-                                artist = song.artist,
-                                album = song.album,
-                                albumId = song.albumId,
-                                duration = song.duration,
-                                uri = song.uri.toString(),
-                                artworkUri = song.artworkUri?.toString(),
-                                trackNumber = song.trackNumber,
-                                year = song.year,
-                                genre = song.genre,
-                                dateAdded = song.dateAdded,
-                                dateModified = song.dateModified,
-                                albumArtist = song.albumArtist,
-                                bitrate = song.bitrate,
-                                sampleRate = song.sampleRate,
-                                channels = song.channels,
-                                codec = song.codec,
-                                discNumber = song.discNumber,
-                                path = song.path
-                            )
-                        }
+                        .map { it.toEntity() }
                         .toList()
 
                     if (distinctDbSongEntities.isNotEmpty()) {
@@ -7107,7 +7106,12 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // New functions for playlist management
-    fun createPlaylist(name: String, songs: List<Song> = emptyList(), showSnackbar: ((String) -> Unit)? = null) {
+    fun createPlaylist(
+        name: String,
+        songs: List<Song> = emptyList(),
+        onCreated: ((Playlist) -> Unit)? = null,
+        showSnackbar: ((String) -> Unit)? = null
+    ) {
         viewModelScope.launch {
             val newPlaylist = repository.createPlaylist(name)
             var updatedPlaylist = newPlaylist
@@ -7128,7 +7132,40 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
             }
-            _playlists.value = _playlists.value + updatedPlaylist
+            _playlists.update { it + updatedPlaylist }
+
+            withContext(Dispatchers.IO) {
+                try {
+                    val playlistDao = repository.playlistDao
+                    playlistDao.insertPlaylist(
+                        PlaylistEntity(
+                            id = updatedPlaylist.id,
+                            name = updatedPlaylist.name,
+                            dateCreated = updatedPlaylist.dateCreated,
+                            dateModified = updatedPlaylist.dateModified,
+                            artworkUri = updatedPlaylist.artworkUri?.toString()
+                        )
+                    )
+                    if (updatedPlaylist.songs.isNotEmpty()) {
+                        val songDao = repository.songDao
+                        val songEntities = updatedPlaylist.songs.map { it.toEntity() }
+                        songDao.upsertAll(songEntities)
+                        val playlistSongEntities = updatedPlaylist.songs.mapIndexed { index, song ->
+                            PlaylistSongEntity(
+                                playlistId = updatedPlaylist.id,
+                                songId = song.id,
+                                orderIndex = index
+                            )
+                        }
+                        playlistSongEntities.chunked(500).forEach { chunk ->
+                            playlistDao.insertPlaylistSongs(chunk)
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error writing new playlist to Room, queueing full save", e)
+                }
+            }
+
             savePlaylists(immediate = true)
             Log.d(TAG, "Created new playlist: ${updatedPlaylist.name} with ${updatedPlaylist.songs.size} songs")
             if (showSnackbar != null) {
@@ -7138,6 +7175,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     showSnackbar("Created playlist '${updatedPlaylist.name}'")
                 }
             }
+            onCreated?.invoke(updatedPlaylist)
         }
     }
 
@@ -7154,27 +7192,65 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         }
         
         var success = false
-        _playlists.value = _playlists.value.map { playlist ->
-            if (playlist.id == playlistId) {
-                // Check if song is already in the playlist
-                if (playlist.songs.any { it.id == song.id }) {
-                    showSnackbar("${song.title} is already in playlist '${playlist.name}'")
-                    playlist
+        var targetOrderIndex = 0
+        var updatedPlaylistEntity: Playlist? = null
+
+        _playlists.update { currentPlaylists ->
+            currentPlaylists.map { playlist ->
+                if (playlist.id == playlistId) {
+                    // Check if song is already in the playlist
+                    if (playlist.songs.any { it.id == song.id }) {
+                        showSnackbar("${song.title} is already in playlist '${playlist.name}'")
+                        playlist
+                    } else {
+                        targetOrderIndex = playlist.songs.size
+                        val updatedSongs = playlist.songs + song
+                        success = true
+                        showSnackbar("Added ${song.title} to ${playlist.name}")
+                        val updated = playlist.copy(
+                            songs = updatedSongs,
+                            dateModified = System.currentTimeMillis()
+                        )
+                        updatedPlaylistEntity = updated
+                        updated
+                    }
                 } else {
-                    val updatedSongs = playlist.songs + song
-                    success = true
-                    showSnackbar("Added ${song.title} to ${playlist.name}")
-                    playlist.copy(
-                        songs = updatedSongs,
-                        dateModified = System.currentTimeMillis()
-                    )
+                    playlist
                 }
-            } else {
-                playlist
             }
         }
-        savePlaylists(immediate = true)
+
         if (success) {
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    val playlistDao = repository.playlistDao
+                    val songDao = repository.songDao
+                    val songEntity = songDao.getSongById(song.id) ?: song.toEntity()
+                    songDao.upsertAll(listOf(songEntity))
+                    playlistDao.insertPlaylistSong(
+                        PlaylistSongEntity(
+                            playlistId = playlistId,
+                            songId = song.id,
+                            orderIndex = targetOrderIndex
+                        )
+                    )
+                    updatedPlaylistEntity?.let { p ->
+                        playlistDao.insertPlaylist(
+                            PlaylistEntity(
+                                id = p.id,
+                                name = p.name,
+                                dateCreated = p.dateCreated,
+                                dateModified = p.dateModified,
+                                artworkUri = p.artworkUri?.toString()
+                            )
+                        )
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error performing targeted playlist song insert, queueing full save", e)
+                }
+            }
+
+            savePlaylists(immediate = true)
             if (playlistId == "1") {
                 val currentFavorites = _favoriteSongs.value.toMutableSet()
                 if (!currentFavorites.contains(song.id)) {
@@ -7199,38 +7275,79 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         val filteredSongsSet: Set<String> = filteredSongs.value.map { song: Song -> song.id }.toSet()
         var successCount = 0
         var playlistName = ""
+        var addedSongsList = listOf<Song>()
+        var startOrderIndex = 0
+        var updatedPlaylistEntity: Playlist? = null
         
-        _playlists.value = _playlists.value.map { playlist ->
-            if (playlist.id == playlistId) {
-                playlistName = playlist.name
-                val existingSongIds = playlist.songs.map { it.id }.toSet()
-                
-                // Filter songs that are not filtered out and not already in playlist
-                val songsToAdd = songs.filter { song ->
-                    val isStreaming = song.uri.toString().startsWith("http://") || 
-                                      song.uri.toString().startsWith("https://") || 
-                                      song.uri.toString().startsWith("streaming://") ||
-                                      _songs.value.none { it.id == song.id }
-                    (isStreaming || filteredSongsSet.contains(song.id)) && !existingSongIds.contains(song.id)
-                }
-                
-                successCount = songsToAdd.size
-                
-                if (songsToAdd.isNotEmpty()) {
-                    val updatedSongs = playlist.songs + songsToAdd
-                    playlist.copy(
-                        songs = updatedSongs,
-                        dateModified = System.currentTimeMillis()
-                    )
+        _playlists.update { currentPlaylists ->
+            currentPlaylists.map { playlist ->
+                if (playlist.id == playlistId) {
+                    playlistName = playlist.name
+                    val existingSongIds = playlist.songs.map { it.id }.toSet()
+                    
+                    // Filter songs that are not filtered out and not already in playlist
+                    val songsToAdd = songs.filter { song ->
+                        val isStreaming = song.uri.toString().startsWith("http://") || 
+                                          song.uri.toString().startsWith("https://") || 
+                                          song.uri.toString().startsWith("streaming://") ||
+                                          _songs.value.none { it.id == song.id }
+                        (isStreaming || filteredSongsSet.contains(song.id)) && !existingSongIds.contains(song.id)
+                    }
+                    
+                    successCount = songsToAdd.size
+                    addedSongsList = songsToAdd
+                    startOrderIndex = playlist.songs.size
+                    
+                    if (songsToAdd.isNotEmpty()) {
+                        val updatedSongs = playlist.songs + songsToAdd
+                        val updated = playlist.copy(
+                            songs = updatedSongs,
+                            dateModified = System.currentTimeMillis()
+                        )
+                        updatedPlaylistEntity = updated
+                        updated
+                    } else {
+                        playlist
+                    }
                 } else {
                     playlist
                 }
-            } else {
-                playlist
             }
         }
         
         if (successCount > 0) {
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    val playlistDao = repository.playlistDao
+                    val songDao = repository.songDao
+                    val songEntities = addedSongsList.map { it.toEntity() }
+                    songDao.upsertAll(songEntities)
+                    val playlistSongEntities = addedSongsList.mapIndexed { index, song ->
+                        PlaylistSongEntity(
+                            playlistId = playlistId,
+                            songId = song.id,
+                            orderIndex = startOrderIndex + index
+                        )
+                    }
+                    playlistSongEntities.chunked(500).forEach { chunk ->
+                        playlistDao.insertPlaylistSongs(chunk)
+                    }
+                    updatedPlaylistEntity?.let { p ->
+                        playlistDao.insertPlaylist(
+                            PlaylistEntity(
+                                id = p.id,
+                                name = p.name,
+                                dateCreated = p.dateCreated,
+                                dateModified = p.dateModified,
+                                artworkUri = p.artworkUri?.toString()
+                            )
+                        )
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error performing targeted batch playlist song insert, queueing full save", e)
+                }
+            }
+
             savePlaylists(immediate = true)
             if (playlistId == "1") {
                 val currentFavorites = _favoriteSongs.value.toMutableSet()
@@ -7253,25 +7370,51 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     fun removeSongFromPlaylist(song: Song, playlistId: String, showSnackbar: (String) -> Unit) {
         var success = false
-        _playlists.value = _playlists.value.map { playlist ->
-            if (playlist.id == playlistId) {
-                val updatedSongs = playlist.songs.filter { it.id != song.id }
-                if (updatedSongs.size < playlist.songs.size) {
-                    success = true
-                    showSnackbar("Removed ${song.title} from ${playlist.name}")
-                    playlist.copy(
-                        songs = updatedSongs,
-                        dateModified = System.currentTimeMillis()
-                    )
+        var updatedPlaylistEntity: Playlist? = null
+
+        _playlists.update { currentPlaylists ->
+            currentPlaylists.map { playlist ->
+                if (playlist.id == playlistId) {
+                    val updatedSongs = playlist.songs.filter { it.id != song.id }
+                    if (updatedSongs.size < playlist.songs.size) {
+                        success = true
+                        showSnackbar("Removed ${song.title} from ${playlist.name}")
+                        val updated = playlist.copy(
+                            songs = updatedSongs,
+                            dateModified = System.currentTimeMillis()
+                        )
+                        updatedPlaylistEntity = updated
+                        updated
+                    } else {
+                        playlist // Song not found in playlist, no change
+                    }
                 } else {
-                    playlist // Song not found in playlist, no change
+                    playlist
                 }
-            } else {
-                playlist
             }
         }
-        savePlaylists(immediate = true)
+
         if (success) {
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    repository.playlistDao.deletePlaylistSong(playlistId, song.id)
+                    updatedPlaylistEntity?.let { p ->
+                        repository.playlistDao.insertPlaylist(
+                            PlaylistEntity(
+                                id = p.id,
+                                name = p.name,
+                                dateCreated = p.dateCreated,
+                                dateModified = p.dateModified,
+                                artworkUri = p.artworkUri?.toString()
+                            )
+                        )
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error performing targeted song removal from Room", e)
+                }
+            }
+
+            savePlaylists(immediate = true)
             if (playlistId == "1") {
                 val currentFavorites = _favoriteSongs.value.toMutableSet()
                 currentFavorites.remove(song.id)
