@@ -32,8 +32,8 @@ android {
         
         val overrideVersionCode = project.findProperty("versionCodeOverride")?.toString()?.toIntOrNull()
         val overrideVersionName = project.findProperty("versionNameOverride")?.toString()
-        versionCode = overrideVersionCode ?: 555001306
-        versionName = overrideVersionName ?: "5.5.500.1306 Beta"
+        versionCode = overrideVersionCode ?: 555001307
+        versionName = overrideVersionName ?: "5.5.500.1307 Beta"
 
         val overrideReleaseDate = project.findProperty("releaseDateOverride")?.toString()
         buildConfigField("String", "RELEASE_DATE", "\"${overrideReleaseDate ?: "2026-10-17"}\"")
@@ -60,7 +60,7 @@ android {
     productFlavors {
         create("fdroid") {
             dimension = "distribution"
-            applicationId = "chromahub.rhythm.app"
+            applicationId = "com.apple.android.music"
             
             // F-Droid build: Enable all features (FOSS ethos)
             buildConfigField("boolean", "ENABLE_YOUTUBE_MUSIC", "true")
@@ -77,7 +77,7 @@ android {
         
         create("github") {
             dimension = "distribution"
-            applicationId = "chromahub.rhythm.app"
+            applicationId = "com.apple.android.music"
             
             // GitHub releases: Enable all features (same as F-Droid)
             buildConfigField("boolean", "ENABLE_YOUTUBE_MUSIC", "true")
